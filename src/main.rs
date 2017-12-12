@@ -4,6 +4,9 @@ extern crate serde;
 extern crate bincode;
 extern crate itertools;
 extern crate ordered_float;
+extern crate seahash;
+extern crate rand;
+extern crate arrayvec;
 
 pub mod priority_queue;
 
@@ -13,12 +16,22 @@ use std::io::prelude::*;
 use std::env;
 use std::path::Path;
 use std::fs;
+use std::hash::Hasher;
+use std::borrow::Borrow;
+use rand::random;
 
 use bincode::{Infinite, serialize_into, deserialize_from};
 use itertools::{chain, Itertools};
 use ordered_float::OrderedFloat;
 
+use seahash::SeaHasher;
+
 use priority_queue::{VecMaxSizePriorityQ, MaxSizePriorityQ};
+
+use arrayvec::ArrayVec;
+use arrayvec::Array;
+
+const NUM_HYPERPLANES: usize = 12;
 
 type SparseVec = HashMap<String, u64>;
 
@@ -35,6 +48,44 @@ enum HamSpamUnk {
 }
 
 type ExactKNNModel = Vec<(SparseVec, HamSpam)>;
+
+#[derive(Serialize, Deserialize, Debug, Eq, PartialEq)]
+struct Hyperplane {
+    k1: u64,
+    k2: u64,
+    k3: u64,
+    k4: u64,
+}
+type HyperplaneEnsemble = [Hyperplane; 64];
+
+#[derive(Serialize, Deserialize, Debug, Eq, PartialEq, Hash)]
+struct HyperplaneHash(u64);
+
+#[derive(Serialize, Deserialize, Debug, Eq, PartialEq)]
+struct ApproxKNNModel {
+    hyperplanes: ArrayVec<HyperplaneEnsemble>,
+    model: HashMap<HyperplaneHash, Vec<HamSpam>>
+}
+
+fn hyperplane_lsh(hyperplanes: &[Hyperplane], vec: &SparseVec) -> HyperplaneHash {
+    let mut lsh = 0;
+    for (idx, hyperplane) in hyperplanes.iter().enumerate() {
+        let mut dot: i64 = 0;
+        for (k, &v) in vec.iter() {
+            let mut hasher = SeaHasher::with_seeds(hyperplane.k1, hyperplane.k2, hyperplane.k3, hyperplane.k4);
+            hasher.write(k.as_bytes());
+            if hasher.finish() > <u64>::max_value() / 2 {
+                dot += v as i64;
+            } else {
+                dot -= v as i64;
+            }
+        }
+        if dot > 0 {
+            lsh |= 1 << idx;
+        }
+    }
+    HyperplaneHash(lsh)
+}
 
 fn convert(email: &str) -> SparseVec {
     let mut v = HashMap::<String, u64>::new();
@@ -68,7 +119,8 @@ fn convert_dir(dirpath: &Path) -> Box<Iterator<Item=SparseVec>> {
     }))
 }
 
-fn make_knn_model(filepath: &Path) -> ExactKNNModel {
+fn dataset_to_vec_stream(filepath: &Path)
+        -> Box<Iterator<Item=(SparseVec, HamSpam)>> {
     let ham_dir = filepath.join("ham");
     let spam_dir = filepath.join("spam");
 
@@ -80,7 +132,39 @@ fn make_knn_model(filepath: &Path) -> ExactKNNModel {
         (spam_vec, HamSpam::Spam)
     });
 
-    chain(ham_stream, spam_stream).collect_vec()
+    Box::new(chain(ham_stream, spam_stream))
+}
+
+fn make_knn_model(filepath: &Path) -> ExactKNNModel {
+    dataset_to_vec_stream(filepath).collect_vec()
+}
+
+fn make_approx_knn_model(filepath: &Path) -> ApproxKNNModel {
+    let vec_stream = dataset_to_vec_stream(filepath);
+    let mut hyperplanes = ArrayVec::<HyperplaneEnsemble>::new();
+    for i in 0..NUM_HYPERPLANES {
+        hyperplanes.insert(i, Hyperplane {
+            k1: rand::random::<u64>(),
+            k2: rand::random::<u64>(),
+            k3: rand::random::<u64>(),
+            k4: rand::random::<u64>()
+        });
+    }
+
+    let mut model = HashMap::<HyperplaneHash, Vec<HamSpam>>::new();
+    for (msg_vec, label) in vec_stream {
+        let hash = hyperplane_lsh(hyperplanes.as_slice(), &msg_vec);
+        if model.contains_key(&hash) {
+            model.get_mut(&hash).unwrap().push(label);
+        } else {
+            model.insert(hash, vec![label]);
+        }
+    }
+
+    ApproxKNNModel {
+        hyperplanes: hyperplanes,
+        model: model,
+    }
 }
 
 fn arcdist(a: &SparseVec, b: &SparseVec) -> f64 {
@@ -141,9 +225,45 @@ fn match_exact(model: &ExactKNNModel, query: &Path) -> HamSpamUnk {
     knn_exact(model, query_vec, 3)
 }
 
+fn match_approx(model: &ApproxKNNModel, query: &Path) -> HamSpamUnk {
+    let query_vec = convert_file(&query).unwrap();
+    println!("Query vec {:?}", query_vec);
+    println!("Hyperplanes {:?}", model.hyperplanes);
+    let query_hash = hyperplane_lsh(
+        model.hyperplanes.as_slice(),
+        &query_vec);
+    println!("Query hash {:?}", query_hash);
+    if let Some(labels) = model.model.get(&query_hash) {
+        let mut ham = 0;
+        let mut spam = 0;
+        for label in labels {
+            match label {
+                &HamSpam::Ham => {
+                    ham += 1;
+                    println!("Ham!");
+                }
+                &HamSpam::Spam => {
+                    spam += 1;
+                    println!("Spam!");
+                }
+            }
+        }
+        if ham > spam {
+            HamSpamUnk::Ham
+        } else if spam > ham {
+            HamSpamUnk::Spam
+        } else {
+            HamSpamUnk::Unk
+        }
+    } else {
+        println!("No match!");
+        HamSpamUnk::Unk
+    }
+}
+
 fn main() {
     let args: Vec<String> = env::args().collect();
-    if args.len() <= 2 {
+    if args.len() <= 3 {
         println!("Not enough args!");
         return;
     }
@@ -152,13 +272,36 @@ fn main() {
             let path_str: &str = args[2].as_ref();
             let path = Path::new(path_str);
             let knn_model = make_knn_model(path);
-            let mut buffer = File::create("model.dat").unwrap();
+            let mut buffer = File::create(&args[3]).unwrap();
+            serialize_into(&mut buffer, &knn_model, Infinite).unwrap();
+        }
+        "make_approx" => {
+            let path_str: &str = args[2].as_ref();
+            let path = Path::new(path_str);
+            let knn_model = make_approx_knn_model(path);
+            let mut buffer = File::create(&args[3]).unwrap();
             serialize_into(&mut buffer, &knn_model, Infinite).unwrap();
         }
         "match_exact" => {
-            let mut buffer = File::open("model.dat").unwrap();
+            let mut buffer = File::open(&args[3]).unwrap();
             let knn_model = deserialize_from(&mut buffer, Infinite).unwrap();
             let result = match_exact(&knn_model, args[2].as_ref());
+            match result {
+                HamSpamUnk::Ham => {
+                    println!("Ham!");
+                }
+                HamSpamUnk::Spam => {
+                    println!("Spam!");
+                }
+                HamSpamUnk::Unk => {
+                    println!("Unknown!");
+                }
+            }
+        }
+        "match_approx" => {
+            let mut buffer = File::open(&args[3]).unwrap();
+            let knn_model = deserialize_from(&mut buffer, Infinite).unwrap();
+            let result = match_approx(&knn_model, args[2].as_ref());
             match result {
                 HamSpamUnk::Ham => {
                     println!("Ham!");
