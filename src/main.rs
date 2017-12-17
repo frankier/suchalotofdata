@@ -8,6 +8,7 @@ extern crate seahash;
 extern crate rand;
 extern crate arrayvec;
 extern crate csv;
+extern crate num;
 
 pub mod priority_queue;
 
@@ -32,6 +33,7 @@ use seahash::SeaHasher;
 use priority_queue::{VecMaxSizePriorityQ, MaxSizePriorityQ};
 
 use arrayvec::ArrayVec;
+use num::clamp;
 
 type SparseVec = HashMap<String, u64>;
 
@@ -203,13 +205,8 @@ fn arcdist(a: &SparseVec, b: &SparseVec) -> f64 {
     for v_b in b.values() {
         mag_b += v_b * v_b;
     }
-    //println!("dot: {}, mag_a: {}, mag_b: {}", dot, mag_a, mag_b);
     let cos_dist = (dot as f64) / ((mag_a as f64).sqrt() * (mag_b as f64).sqrt());
-    if cos_dist > 1.0 || cos_dist < -1.0 {
-
-        //println!("cos_dist: {}", cos_dist);
-    }
-    cos_dist.acos()
+    clamp(cos_dist, -1.0, 1.0).acos()
 }
 
 fn knn_exact(model: &ExactKNNModel, query: SparseVec, k: u32) -> HamSpamUnk {
@@ -302,7 +299,7 @@ fn smallest_dist(model: &ExactKNNModel, query: &SparseVec) -> f64 {
 
 fn task3(path: &Path) {
     let mut wtr = csv::Writer::from_writer(File::create("chart.csv").unwrap());
-    wtr.write_record(&["num_hyperplanes", "secs", "nanos", "abs_err_sum"]).unwrap();
+    wtr.write_record(&["num_hyperplanes", "secs", "nanos", "mean_abs_err"]).unwrap();
     // Load the messages from the first five datasets in memory
     let full = [
         "enron1",
@@ -368,12 +365,13 @@ fn task3(path: &Path) {
         let abs_err_sum: f64 = approx_smallest_dists.iter().zip(&exact_smallest_dists)
                 .map(|(a, b)| {
             if a.is_infinite() {
-                0.0
+                panic!("Didn't expect infinite distances")
             } else {
                 a - b
             }
         }).sum();
-        wtr.serialize((num_hyperplanes, secs, nanos, abs_err_sum)).unwrap();
+        let avg_abs_err = abs_err_sum / 100.0;
+        wtr.serialize((num_hyperplanes, secs, nanos, avg_abs_err)).unwrap();
     }
 }
 
