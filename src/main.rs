@@ -7,6 +7,7 @@ extern crate ordered_float;
 extern crate seahash;
 extern crate rand;
 extern crate arrayvec;
+extern crate csv;
 
 pub mod priority_queue;
 
@@ -18,7 +19,9 @@ use std::path::Path;
 use std::fs;
 use std::hash::Hasher;
 use std::borrow::Borrow;
-use rand::random;
+use rand::{random, thread_rng, Rng};
+use std::time::Instant;
+use std::f64::INFINITY;
 
 use bincode::{Infinite, serialize_into, deserialize_from};
 use itertools::{chain, Itertools};
@@ -29,9 +32,6 @@ use seahash::SeaHasher;
 use priority_queue::{VecMaxSizePriorityQ, MaxSizePriorityQ};
 
 use arrayvec::ArrayVec;
-use arrayvec::Array;
-
-const NUM_HYPERPLANES: usize = 12;
 
 type SparseVec = HashMap<String, u64>;
 
@@ -62,9 +62,15 @@ type HyperplaneEnsemble = [Hyperplane; 64];
 struct HyperplaneHash(u64);
 
 #[derive(Serialize, Deserialize, Debug, Eq, PartialEq)]
-struct ApproxKNNModel {
+struct OnlyApproxKNNModel {
     hyperplanes: ArrayVec<HyperplaneEnsemble>,
-    model: HashMap<HyperplaneHash, Vec<HamSpam>>
+    model: HashMap<HyperplaneHash, Vec<usize>>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Eq, PartialEq)]
+struct ApproxKNNModel {
+    approx: OnlyApproxKNNModel,
+    full: ExactKNNModel,
 }
 
 fn hyperplane_lsh(hyperplanes: &[Hyperplane], vec: &SparseVec) -> HyperplaneHash {
@@ -119,20 +125,32 @@ fn convert_dir(dirpath: &Path) -> Box<Iterator<Item=SparseVec>> {
     }))
 }
 
-fn dataset_to_vec_stream(filepath: &Path)
-        -> Box<Iterator<Item=(SparseVec, HamSpam)>> {
+fn dataset_to_vec_streams(filepath: &Path)
+        -> (Box<Iterator<Item=SparseVec>>, Box<Iterator<Item=SparseVec>>) {
     let ham_dir = filepath.join("ham");
     let spam_dir = filepath.join("spam");
 
     let ham_stream = convert_dir(&ham_dir).map(|ham_vec| {
-        (ham_vec, HamSpam::Ham)
+        ham_vec
     });
 
     let spam_stream = convert_dir(&spam_dir).map(|spam_vec| {
-        (spam_vec, HamSpam::Spam)
+        spam_vec
     });
 
-    Box::new(chain(ham_stream, spam_stream))
+    (Box::new(ham_stream), Box::new(spam_stream))
+}
+
+fn dataset_to_vec_stream(filepath: &Path)
+        -> Box<Iterator<Item=(SparseVec, HamSpam)>> {
+    let (ham_stream, spam_stream) = dataset_to_vec_streams(filepath);
+
+    Box::new(chain(
+        ham_stream.map(|v| {
+            (v, HamSpam::Ham)
+        }), spam_stream.map(|v| {
+            (v, HamSpam::Spam)
+        })))
 }
 
 fn make_knn_model(filepath: &Path) -> ExactKNNModel {
@@ -140,10 +158,15 @@ fn make_knn_model(filepath: &Path) -> ExactKNNModel {
 }
 
 fn make_approx_knn_model(filepath: &Path) -> ApproxKNNModel {
-    let vec_stream = dataset_to_vec_stream(filepath);
+    let full = make_knn_model(filepath);
+    let approx = approxify(&full, 12);
+    ApproxKNNModel { full, approx }
+}
+
+fn approxify(exact_model: &ExactKNNModel, num_hyperplanes: u8) -> OnlyApproxKNNModel {
     let mut hyperplanes = ArrayVec::<HyperplaneEnsemble>::new();
-    for i in 0..NUM_HYPERPLANES {
-        hyperplanes.insert(i, Hyperplane {
+    for i in 0..num_hyperplanes {
+        hyperplanes.insert(i as usize, Hyperplane {
             k1: rand::random::<u64>(),
             k2: rand::random::<u64>(),
             k3: rand::random::<u64>(),
@@ -151,19 +174,19 @@ fn make_approx_knn_model(filepath: &Path) -> ApproxKNNModel {
         });
     }
 
-    let mut model = HashMap::<HyperplaneHash, Vec<HamSpam>>::new();
-    for (msg_vec, label) in vec_stream {
-        let hash = hyperplane_lsh(hyperplanes.as_slice(), &msg_vec);
-        if model.contains_key(&hash) {
-            model.get_mut(&hash).unwrap().push(label);
+    let mut approx_model = HashMap::<HyperplaneHash, Vec<usize>>::new();
+    for (idx, &(ref msg_vec, _)) in exact_model.iter().enumerate() {
+        let hash = hyperplane_lsh(hyperplanes.as_slice(), msg_vec);
+        if approx_model.contains_key(&hash) {
+            approx_model.get_mut(&hash).unwrap().push(idx);
         } else {
-            model.insert(hash, vec![label]);
+            approx_model.insert(hash, vec![idx]);
         }
     }
 
-    ApproxKNNModel {
+    OnlyApproxKNNModel {
         hyperplanes: hyperplanes,
-        model: model,
+        model: approx_model,
     }
 }
 
@@ -225,18 +248,23 @@ fn match_exact(model: &ExactKNNModel, query: &Path) -> HamSpamUnk {
     knn_exact(model, query_vec, 3)
 }
 
+fn hash_match<'a>(approx: &'a OnlyApproxKNNModel, query_vec: &SparseVec)
+        -> Option<&'a Vec<usize>> {
+    let query_hash = hyperplane_lsh(
+        approx.hyperplanes.as_slice(),
+        &query_vec);
+    approx.model.get(&query_hash)
+}
+
 fn match_approx(model: &ApproxKNNModel, query: &Path) -> HamSpamUnk {
     let query_vec = convert_file(&query).unwrap();
     println!("Query vec {:?}", query_vec);
-    println!("Hyperplanes {:?}", model.hyperplanes);
-    let query_hash = hyperplane_lsh(
-        model.hyperplanes.as_slice(),
-        &query_vec);
-    println!("Query hash {:?}", query_hash);
-    if let Some(labels) = model.model.get(&query_hash) {
+    println!("Hyperplanes {:?}", model.approx.hyperplanes);
+    if let Some(idxs) = hash_match(&model.approx, &query_vec) {
         let mut ham = 0;
         let mut spam = 0;
-        for label in labels {
+        for idx in idxs {
+            let (_, ref label) = model.full[*idx];
             match label {
                 &HamSpam::Ham => {
                     ham += 1;
@@ -261,14 +289,102 @@ fn match_approx(model: &ApproxKNNModel, query: &Path) -> HamSpamUnk {
     }
 }
 
+fn smallest_dist(model: &ExactKNNModel, query: &SparseVec) -> f64 {
+    let mut min_d = INFINITY;
+    for &(ref vec, _) in model.iter() {
+        let d = arcdist(&query, vec);
+        if d < min_d {
+            min_d = d;
+        }
+    }
+    min_d
+}
+
+fn task3(path: &Path) {
+    let mut wtr = csv::Writer::from_writer(File::create("chart.csv").unwrap());
+    wtr.write_record(&["num_hyperplanes", "secs", "nanos", "abs_err_sum"]).unwrap();
+    // Load the messages from the first five datasets in memory
+    let full = [
+        "enron1",
+        "enron2",
+        "enron3",
+        "enron4",
+        "enron5"
+    ].iter().flat_map(|model_dir| {
+        dataset_to_vec_stream(&path.join(model_dir))
+    }).collect_vec();
+    // Load 100 messages (50 spam, 50 genuine) from the sixth dataset - the query messages
+    let (ham_stream, spam_stream) = dataset_to_vec_streams(&path.join("enron6"));
+    let query_msgs = chain(ham_stream.take(50), spam_stream.take(50)).collect_vec();
+    println!("Data loaded. Starting experiments.");
+    //For each query message find the distance of the exact nearest neighbor.
+        //Record the time needed for this computation
+    let mut exact_smallest_dists = ArrayVec::<[f64; 100]>::new();
+    let nn_start = Instant::now();
+    for query in query_msgs.iter() {
+        exact_smallest_dists.push(smallest_dist(&full, query));
+    }
+    let nn_time = nn_start.elapsed();
+    let secs = nn_time.as_secs();
+    let nanos = nn_time.subsec_nanos() as u64;
+    println!("Exact time {} {}", secs, nanos);
+    println!("smallest_dists {:?}", exact_smallest_dists);
+    wtr.serialize((0, secs, nanos, 0)).unwrap();
+    //For numberOfHyperplanes in [1, 2, 4, 8, 16, 32]: #You can go up till 60/64 if it does not take too much time to compute
+    for num_hyperplanes in [1, 2, 4, 8, 16, 32, 64].iter() {
+        println!("{} hyperplanes", num_hyperplanes);
+        //Create the data structure from Part II with numberOfHyperplanes hyper planes
+        let approx_model = approxify(&full, *num_hyperplanes);
+        let mut approx_smallest_dists = ArrayVec::<[f64; 100]>::new();
+        //Start a timer
+        let approx_nn_start = Instant::now();
+        //For each query message
+            //Find the result and distance for the approximate search
+        for query in query_msgs.iter() {
+            if let Some(idxs) = hash_match(&approx_model, &query) {
+                let mut min_d = INFINITY;
+                for idx in idxs.iter() {
+                    let (ref vec, _) = full[*idx];
+                    let d = arcdist(&query, vec);
+                    if d < min_d {
+                        min_d = d;
+                    }
+                }
+                approx_smallest_dists.push(min_d);
+            } else {
+                let mut rng = thread_rng();
+                let &(ref rand_vec, _) = rng.choose(&full).unwrap();
+                let d = arcdist(&query, rand_vec);
+                approx_smallest_dists.push(d);
+            }
+        }
+        println!("smallest_dists {:?}", approx_smallest_dists);
+        //Stop the timer
+        let approx_nn_time = approx_nn_start.elapsed();
+        let secs = approx_nn_time.as_secs();
+        let nanos = approx_nn_time.subsec_nanos() as u64;
+        println!("Approx time {} {}", secs, nanos);
+        //Calculate the average error for the current number of hyperplanes formula for calculation of average absolute error
+        let abs_err_sum: f64 = approx_smallest_dists.iter().zip(&exact_smallest_dists)
+                .map(|(a, b)| {
+            if a.is_infinite() {
+                0.0
+            } else {
+                a - b
+            }
+        }).sum();
+        wtr.serialize((num_hyperplanes, secs, nanos, abs_err_sum)).unwrap();
+    }
+}
+
 fn main() {
     let args: Vec<String> = env::args().collect();
-    if args.len() <= 3 {
-        println!("Not enough args!");
-        return;
-    }
     match args[1].as_ref() {
         "make" => {
+            if args.len() <= 3 {
+                println!("Not enough args!");
+                return;
+            }
             let path_str: &str = args[2].as_ref();
             let path = Path::new(path_str);
             let knn_model = make_knn_model(path);
@@ -276,6 +392,10 @@ fn main() {
             serialize_into(&mut buffer, &knn_model, Infinite).unwrap();
         }
         "make_approx" => {
+            if args.len() <= 3 {
+                println!("Not enough args!");
+                return;
+            }
             let path_str: &str = args[2].as_ref();
             let path = Path::new(path_str);
             let knn_model = make_approx_knn_model(path);
@@ -283,6 +403,10 @@ fn main() {
             serialize_into(&mut buffer, &knn_model, Infinite).unwrap();
         }
         "match_exact" => {
+            if args.len() <= 3 {
+                println!("Not enough args!");
+                return;
+            }
             let mut buffer = File::open(&args[3]).unwrap();
             let knn_model = deserialize_from(&mut buffer, Infinite).unwrap();
             let result = match_exact(&knn_model, args[2].as_ref());
@@ -299,6 +423,10 @@ fn main() {
             }
         }
         "match_approx" => {
+            if args.len() <= 3 {
+                println!("Not enough args!");
+                return;
+            }
             let mut buffer = File::open(&args[3]).unwrap();
             let knn_model = deserialize_from(&mut buffer, Infinite).unwrap();
             let result = match_approx(&knn_model, args[2].as_ref());
@@ -313,6 +441,15 @@ fn main() {
                     println!("Unknown!");
                 }
             }
+        }
+        "task3" => {
+            if args.len() <= 2 {
+                println!("Not enough args!");
+                return;
+            }
+            let path_str: &str = args[2].as_ref();
+            let path = Path::new(path_str);
+            task3(path);
         }
         _ => {
             println!("Unknown command {}", args[1]);
