@@ -37,16 +37,10 @@ use num::clamp;
 
 type SparseVec = HashMap<String, u64>;
 
-#[derive(Serialize, Deserialize, Debug, Eq, PartialEq, PartialOrd, Ord)]
+#[derive(Serialize, Deserialize, Debug, Eq, PartialEq, PartialOrd, Ord, Copy, Clone)]
 enum HamSpam {
     Ham,
     Spam,
-}
-
-enum HamSpamUnk {
-    Ham,
-    Spam,
-    Unk,
 }
 
 type ExactKNNModel = Vec<(SparseVec, HamSpam)>;
@@ -64,14 +58,16 @@ type HyperplaneEnsemble = [Hyperplane; 64];
 struct HyperplaneHash(u64);
 
 #[derive(Serialize, Deserialize, Debug, Eq, PartialEq)]
-struct OnlyApproxKNNModel {
+struct SingleApproxKNNModel {
     hyperplanes: ArrayVec<HyperplaneEnsemble>,
     model: HashMap<HyperplaneHash, Vec<usize>>,
 }
 
+type MultApproxKNNModel = Vec<SingleApproxKNNModel>;
+
 #[derive(Serialize, Deserialize, Debug, Eq, PartialEq)]
-struct ApproxKNNModel {
-    approx: OnlyApproxKNNModel,
+struct FullApproxKNNModel {
+    approx: MultApproxKNNModel,
     full: ExactKNNModel,
 }
 
@@ -159,13 +155,19 @@ fn make_knn_model(filepath: &Path) -> ExactKNNModel {
     dataset_to_vec_stream(filepath).collect_vec()
 }
 
-fn make_approx_knn_model(filepath: &Path) -> ApproxKNNModel {
-    let full = make_knn_model(filepath);
-    let approx = approxify(&full, 12);
-    ApproxKNNModel { full, approx }
+fn make_approx_knn_model_from_full(full: ExactKNNModel, num_hyperplanes: u8, bands: u8) -> FullApproxKNNModel {
+    let approx = (1..bands).map(|_| {
+        approxify(&full, 12)
+    }).collect_vec();
+    FullApproxKNNModel { full, approx }
 }
 
-fn approxify(exact_model: &ExactKNNModel, num_hyperplanes: u8) -> OnlyApproxKNNModel {
+fn make_approx_knn_model(filepath: &Path, num_hyperplanes: u8, bands: u8) -> FullApproxKNNModel {
+    let full = make_knn_model(filepath);
+    make_approx_knn_model_from_full(full, num_hyperplanes, bands)
+}
+
+fn approxify(exact_model: &ExactKNNModel, num_hyperplanes: u8) -> SingleApproxKNNModel {
     let mut hyperplanes = ArrayVec::<HyperplaneEnsemble>::new();
     for i in 0..num_hyperplanes {
         hyperplanes.insert(i as usize, Hyperplane {
@@ -186,7 +188,7 @@ fn approxify(exact_model: &ExactKNNModel, num_hyperplanes: u8) -> OnlyApproxKNNM
         }
     }
 
-    OnlyApproxKNNModel {
+    SingleApproxKNNModel {
         hyperplanes: hyperplanes,
         model: approx_model,
     }
@@ -209,7 +211,7 @@ fn arcdist(a: &SparseVec, b: &SparseVec) -> f64 {
     clamp(cos_dist, -1.0, 1.0).acos()
 }
 
-fn knn_exact(model: &ExactKNNModel, query: SparseVec, k: u32) -> HamSpamUnk {
+fn knn_exact(model: &ExactKNNModel, query: SparseVec, k: u32) -> Option<HamSpam> {
     println!("Query vector:");
     println!("{:?}", query);
     let mut q = VecMaxSizePriorityQ::new(k);
@@ -232,20 +234,20 @@ fn knn_exact(model: &ExactKNNModel, query: SparseVec, k: u32) -> HamSpamUnk {
         }
     }
     if ham > spam {
-        HamSpamUnk::Ham
+        Some(HamSpam::Ham)
     } else if spam > ham {
-        HamSpamUnk::Spam
+        Some(HamSpam::Spam)
     } else {
-        HamSpamUnk::Unk
+        None
     }
 }
 
-fn match_exact(model: &ExactKNNModel, query: &Path) -> HamSpamUnk {
+fn match_exact(model: &ExactKNNModel, query: &Path) -> Option<HamSpam> {
     let query_vec = convert_file(&query).unwrap();
     knn_exact(model, query_vec, 3)
 }
 
-fn hash_match<'a>(approx: &'a OnlyApproxKNNModel, query_vec: &SparseVec)
+fn hash_match<'a>(approx: &'a SingleApproxKNNModel, query_vec: &SparseVec)
         -> Option<&'a Vec<usize>> {
     let query_hash = hyperplane_lsh(
         approx.hyperplanes.as_slice(),
@@ -253,36 +255,41 @@ fn hash_match<'a>(approx: &'a OnlyApproxKNNModel, query_vec: &SparseVec)
     approx.model.get(&query_hash)
 }
 
-fn match_approx(model: &ApproxKNNModel, query: &Path) -> HamSpamUnk {
+fn hash_match_mult(approx: &MultApproxKNNModel, query_vec: &SparseVec)
+        -> Vec<usize> {
+    approx.iter().flat_map(|elem| {
+        if let Some(idxs) = hash_match(elem, query_vec) {
+            idxs.to_owned()
+        } else {
+            vec![]
+        }
+    }).collect_vec()
+}
+
+fn match_approx(model: &FullApproxKNNModel, query: &Path) -> Option<HamSpam> {
     let query_vec = convert_file(&query).unwrap();
-    println!("Query vec {:?}", query_vec);
-    println!("Hyperplanes {:?}", model.approx.hyperplanes);
-    if let Some(idxs) = hash_match(&model.approx, &query_vec) {
-        let mut ham = 0;
-        let mut spam = 0;
-        for idx in idxs {
-            let (_, ref label) = model.full[*idx];
-            match label {
-                &HamSpam::Ham => {
-                    ham += 1;
-                    println!("Ham!");
-                }
-                &HamSpam::Spam => {
-                    spam += 1;
-                    println!("Spam!");
-                }
+    let idxs = hash_match_mult(&model.approx, &query_vec);
+    let mut ham = 0;
+    let mut spam = 0;
+    for idx in idxs {
+        let (_, ref label) = model.full[idx];
+        match label {
+            &HamSpam::Ham => {
+                ham += 1;
+                println!("Ham!");
+            }
+            &HamSpam::Spam => {
+                spam += 1;
+                println!("Spam!");
             }
         }
-        if ham > spam {
-            HamSpamUnk::Ham
-        } else if spam > ham {
-            HamSpamUnk::Spam
-        } else {
-            HamSpamUnk::Unk
-        }
+    }
+    if ham > spam {
+        Some(HamSpam::Ham)
+    } else if spam > ham {
+        Some(HamSpam::Spam)
     } else {
-        println!("No match!");
-        HamSpamUnk::Unk
+        None
     }
 }
 
@@ -297,11 +304,8 @@ fn smallest_dist(model: &ExactKNNModel, query: &SparseVec) -> f64 {
     min_d
 }
 
-fn task3(path: &Path) {
-    let mut wtr = csv::Writer::from_writer(File::create("chart.csv").unwrap());
-    wtr.write_record(&["num_hyperplanes", "secs", "nanos", "mean_abs_err"]).unwrap();
-    // Load the messages from the first five datasets in memory
-    let full = [
+fn make_first5_model(path: &Path) -> ExactKNNModel {
+    [
         "enron1",
         "enron2",
         "enron3",
@@ -309,7 +313,14 @@ fn task3(path: &Path) {
         "enron5"
     ].iter().flat_map(|model_dir| {
         dataset_to_vec_stream(&path.join(model_dir))
-    }).collect_vec();
+    }).collect_vec()
+}
+
+fn task3(path: &Path) {
+    let mut wtr = csv::Writer::from_writer(File::create("chart.csv").unwrap());
+    wtr.write_record(&["num_hyperplanes", "secs", "nanos", "mean_abs_err"]).unwrap();
+    // Load the messages from the first five datasets in memory
+    let full = make_first5_model(path);
     // Load 100 messages (50 spam, 50 genuine) from the sixth dataset - the query messages
     let (ham_stream, spam_stream) = dataset_to_vec_streams(&path.join("enron6"));
     let query_msgs = chain(ham_stream.take(50), spam_stream.take(50)).collect_vec();
@@ -375,6 +386,47 @@ fn task3(path: &Path) {
     }
 }
 
+fn task4(path: &Path) {
+    let full = make_first5_model(path);
+    let model = make_approx_knn_model_from_full(full, 16, 4);
+    let mut true_ham = 0;
+    let mut false_ham = 0;
+    let mut true_spam = 0;
+    let mut false_spam = 0;
+    let mut no_pred = 0;
+    let stream = dataset_to_vec_stream(&path.join("enron6"));
+    for (query_vec, actual_hamspam) in stream {
+        let idxs = hash_match_mult(&model.approx, &query_vec);
+        let min_d = INFINITY;
+        let mut pred_hamspamunk: Option<HamSpam> = None;
+        for idx in idxs {
+            let (ref hit_vec, ref label) = model.full[idx];
+            let d = arcdist(hit_vec, &query_vec);
+            if d < min_d {
+                pred_hamspamunk = Some(*label);
+            }
+        }
+        if pred_hamspamunk == Some(HamSpam::Ham) {
+            if actual_hamspam == HamSpam::Ham {
+                true_ham += 1;
+            } else {
+                false_ham += 1;
+            }
+        } else if pred_hamspamunk == Some(HamSpam::Spam) {
+            if actual_hamspam == HamSpam::Spam {
+                true_spam += 1;
+            } else {
+                false_spam += 1;
+            }
+        } else {
+            no_pred += 1;
+        }
+    }
+    println!(
+        "true_ham: {} false_ham: {} true_spam: {} false_spam: {} no_pred: {}",
+        true_ham, false_ham, true_spam, false_spam, no_pred);
+}
+
 fn main() {
     let args: Vec<String> = env::args().collect();
     match args[1].as_ref() {
@@ -396,7 +448,7 @@ fn main() {
             }
             let path_str: &str = args[2].as_ref();
             let path = Path::new(path_str);
-            let knn_model = make_approx_knn_model(path);
+            let knn_model = make_approx_knn_model(path, 12, 1);
             let mut buffer = File::create(&args[3]).unwrap();
             serialize_into(&mut buffer, &knn_model, Infinite).unwrap();
         }
@@ -409,13 +461,13 @@ fn main() {
             let knn_model = deserialize_from(&mut buffer, Infinite).unwrap();
             let result = match_exact(&knn_model, args[2].as_ref());
             match result {
-                HamSpamUnk::Ham => {
+                Some(HamSpam::Ham) => {
                     println!("Ham!");
                 }
-                HamSpamUnk::Spam => {
+                Some(HamSpam::Spam) => {
                     println!("Spam!");
                 }
-                HamSpamUnk::Unk => {
+                None => {
                     println!("Unknown!");
                 }
             }
@@ -429,13 +481,13 @@ fn main() {
             let knn_model = deserialize_from(&mut buffer, Infinite).unwrap();
             let result = match_approx(&knn_model, args[2].as_ref());
             match result {
-                HamSpamUnk::Ham => {
+                Some(HamSpam::Ham) => {
                     println!("Ham!");
                 }
-                HamSpamUnk::Spam => {
+                Some(HamSpam::Spam) => {
                     println!("Spam!");
                 }
-                HamSpamUnk::Unk => {
+                None => {
                     println!("Unknown!");
                 }
             }
@@ -448,6 +500,15 @@ fn main() {
             let path_str: &str = args[2].as_ref();
             let path = Path::new(path_str);
             task3(path);
+        }
+        "task4" => {
+            if args.len() <= 2 {
+                println!("Not enough args!");
+                return;
+            }
+            let path_str: &str = args[2].as_ref();
+            let path = Path::new(path_str);
+            task4(path);
         }
         _ => {
             println!("Unknown command {}", args[1]);

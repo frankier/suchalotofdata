@@ -61,3 +61,21 @@ Task 3 can be tested using:
 A place to start reading the code is:
 
     fn task3...
+
+Task 4
+======
+
+You can run this task using:
+
+    $ cargo run task4 .
+
+A place to start reading the code is:
+
+    fn task4...
+
+The nearest 1 strategy is used. I also collected numbers for which no
+prediction was made because there was no result in the 4 bands, 16 rows setup.
+
+The results are:
+
+true_ham: 256 false_ham: 386 true_spam: 3668 false_spam: 1241 no_pred: 14
