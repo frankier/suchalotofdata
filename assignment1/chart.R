@@ -1,19 +1,3 @@
-#chart <- read.csv('chart.csv');
-#chart$acc_secs <- chart$secs + chart$nanos / 1000000000;
-#
-#par(mar = c(5,5,2,5))
-#plot(abs_err_sum ~ num_hyperplanes, log = "x", data=chart, xaxt='n');
-#par(new = T);
-#plot(acc_secs ~ num_hyperplanes, log = "x", data=chart, axes=F, xlab=NA, ylab=NA);
-#axis(side = 4);
-#mtext(side = 4, line = 3, 'acc_secs');
-#legend("topleft",
-#       legend=c(expression(-log[10](italic(p))), "N genes"),
-#       lty=c(1,0), pch=c(NA, 16), col=c("red3", "black"));
-#
-#axis(1, at=c(0.5, 1, 2, 4, 8, 16, 32, 64), labels=c(0, 1, 2, 4, 8, 16, 32, 64));
-
-
 library(ggplot2)
 library(reshape2)
 
