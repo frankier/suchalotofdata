@@ -28,7 +28,7 @@ use bincode::{Infinite, serialize_into, deserialize_from};
 use itertools::{chain, Itertools};
 use ordered_float::OrderedFloat;
 
-use seahash::SeaHasher;
+use seahash::hash_seeded;
 
 use priority_queue::{VecMaxSizePriorityQ, MaxSizePriorityQ};
 
@@ -76,9 +76,13 @@ fn hyperplane_lsh(hyperplanes: &[Hyperplane], vec: &SparseVec) -> HyperplaneHash
     for (idx, hyperplane) in hyperplanes.iter().enumerate() {
         let mut dot: i64 = 0;
         for (k, &v) in vec.iter() {
-            let mut hasher = SeaHasher::with_seeds(hyperplane.k1, hyperplane.k2, hyperplane.k3, hyperplane.k4);
-            hasher.write(k.as_bytes());
-            if hasher.finish() > <u64>::max_value() / 2 {
+            let h = hash_seeded(
+                k.as_bytes(),
+                hyperplane.k1,
+                hyperplane.k2,
+                hyperplane.k3,
+                hyperplane.k4);
+            if h > <u64>::max_value() / 2 {
                 dot += v as i64;
             } else {
                 dot -= v as i64;
