@@ -75,3 +75,15 @@ calculate the bias values for HyperLogLog. The main reason I did this was to
 see if it would have been possible to avoid part at least part of the integral
 analysis towards the end of the HyperLogLog paper by "just calculating it
 instead". It turns out it is, at least this time.
+
+Task 3
+======
+
+To run this part, you should be able to either import the directory `exactcard`
+into Eclipse, or use the fat JAR I've included in source control,
+`exactcard-all.jar`.
+
+ $ mkdir inputs
+ $ java -jar generator.jar 10000 1 > inputs/10000.txt
+ $ rm -rf outputs/ intermediate_output/
+ $ /path/to/hadoop/bin/hadoop jar exactcard-all.jar inputs/ intermediate_output outputs >! log 2>&1
